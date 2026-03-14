@@ -469,6 +469,93 @@ def resolve_hostname(ip: str) -> str:
         _dns_cache[ip] = host
     return host
 
+
+def enrich_ip(ip: str) -> dict:
+    """
+    Reichert eine IP-Adresse mit allen verfügbaren Infos an:
+    - Hostname (DNS/nslookup)
+    - Geo-IP (Land, Stadt)
+    - WHOIS (Besitzer/Organisation)
+    - Threat-Intel Status
+
+    Läuft im Hintergrund (für E-Mail-Versand), kein UI-Timeout nötig.
+    """
+    result = {
+        "hostname":     "–",
+        "geo":          "–",
+        "org":          "–",
+        "whois_raw":    "–",
+        "threat_intel": False,
+    }
+
+    # ── Hostname (DNS) ────────────────────────────────────────────────────
+    try:
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(3.0)   # E-Mail läuft async → 3s OK
+        result["hostname"] = socket.gethostbyaddr(ip)[0]
+        socket.setdefaulttimeout(old_timeout)
+    except Exception:
+        result["hostname"] = "Nicht auflösbar"
+
+    # ── Geo-IP ────────────────────────────────────────────────────────────
+    try:
+        if _geo_reader:
+            r = _geo_reader.city(ip)
+            city    = r.city.name    or ""
+            country = r.country.name or ""
+            iso     = r.country.iso_code or ""
+            result["geo"] = f"{city}, {country} ({iso})" if city else f"{country} ({iso})"
+    except Exception:
+        pass
+
+    # ── WHOIS / Organisation ──────────────────────────────────────────────
+    # Plattformabhängig: nslookup (alle) + whois (Linux/macOS)
+    # Genau wie manuell im Terminal – keine externe API nötig
+
+    # nslookup – funktioniert auf Windows, Linux und macOS
+    try:
+        r = subprocess.run(
+            ["nslookup", ip],
+            capture_output=True, text=True, timeout=5
+        )
+        # Relevante Zeilen aus nslookup-Output extrahieren
+        lines = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line and not line.startswith(("Server:", "Address:", "**")):
+                if "name =" in line.lower() or "name=" in line.lower():
+                    lines.append(line)
+        if lines:
+            result["org"] = lines[0]
+    except Exception:
+        pass
+
+    # whois – nur Linux und macOS (auf Windows nicht standardmäßig vorhanden)
+    if platform.system() in ("Linux", "Darwin"):
+        try:
+            r = subprocess.run(
+                ["whois", ip],
+                capture_output=True, text=True, timeout=8
+            )
+            org_lines = []
+            for line in r.stdout.splitlines():
+                low = line.lower().strip()
+                if any(k in low for k in ("orgname:", "org-name:", "netname:",
+                                          "descr:", "owner:", "organization:")):
+                    val = line.split(":", 1)[1].strip() if ":" in line else ""
+                    if val and len(val) > 2:
+                        org_lines.append(val)
+            if org_lines:
+                result["org"] = org_lines[0]
+        except Exception:
+            pass
+
+    # ── Threat Intelligence ───────────────────────────────────────────────
+    if _threat_intel:
+        result["threat_intel"] = _threat_intel.is_bad(ip)
+
+    return result
+
 _geo_reader = None
 if GEOIP_OK and GEOIP_DB.exists():
     try:
@@ -821,8 +908,7 @@ class EmailNotifier:
             html_body = f"""
             <html><body style="font-family:monospace;background:#1a1a2e;color:#eee;padding:20px">
             <h2 style="color:#e94560">🚨 Net-Fire-Monitor Alarm</h2>
-            <pre style="background:#16213e;padding:15px;border-radius:8px;color:#0f3460;
-                        color:#a8dadc">{body}</pre>
+            <pre style="background:#16213e;padding:15px;border-radius:8px;color:#a8dadc;line-height:1.7">{body}</pre>
             <hr style="border-color:#444">
             <small style="color:#888">Net-Fire-Monitor v1.0 – OpenScan Projekt</small>
             </body></html>
@@ -1237,15 +1323,37 @@ class NetworkMonitor:
 
         # E-Mail Benachrichtigung
         if _email:
-            body = (
-                f"Zeitpunkt : {ts}\n"
-                f"Alarm     : {message}\n"
-                f"Quelle IP : {src_ip or '–'}\n"
-                f"Grund     : {reason or '–'}\n"
-                f"Modus     : {self.cfg.firewall_mode}\n"
-            )
-            if _firewall and src_ip in _firewall.blocked_ips:
-                body += f"Aktion    : IP wurde automatisch blockiert ✅\n"
+            # IP anreichern (läuft async in E-Mail-Queue → kein UI-Lag)
+            if src_ip:
+                info = enrich_ip(src_ip)
+                threat_marker = "☠️  JA – in Threat-Intel-Liste!" if info["threat_intel"] else "✅ Vermutlich Nein (Es liegen keine bekannten Bedrohungen durch diese IP vor)"
+                blocked_line  = ""
+                if _firewall and src_ip in _firewall.blocked_ips:
+                    blocked_line = "Aktion    : IP wurde automatisch blockiert 🚫\n"
+
+                body = (
+                    f"Zeitpunkt : {ts}\n"
+                    f"Alarm     : {message}\n"
+                    f"\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"IP-Analyse: {src_ip}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Hostname  : {info['hostname']}\n"
+                    f"Geo-IP    : {info['geo']}\n"
+                    f"Besitzer  : {info['org']}\n"
+                    f"Bedrohung : {threat_marker}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Grund     : {reason or '–'}\n"
+                    f"Modus     : {self.cfg.firewall_mode}\n"
+                    f"{blocked_line}"
+                )
+            else:
+                body = (
+                    f"Zeitpunkt : {ts}\n"
+                    f"Alarm     : {message}\n"
+                    f"Grund     : {reason or '–'}\n"
+                    f"Modus     : {self.cfg.firewall_mode}\n"
+                )
             _email.send(subject=message[:60], body=body)
 
         # Firewall-Aktion je nach Modus
