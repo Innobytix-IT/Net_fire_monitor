@@ -220,9 +220,9 @@ class FirewallRule:
 @dataclass
 class Config:
     # Basis
-    average_period:   int  = 60
+    average_period:   int  = 120
     monitor_interval: int  = 10
-    threshold:        int  = 20
+    threshold:        int  = 50
 
     bpf_filter: str = field(default_factory=lambda: (
         "ip or ip6" if platform.system() == "Windows"
@@ -1231,23 +1231,46 @@ class FirewallEngine:
             ips = list(self.blocked_ips)
         for ip in ips:
             self._do_unblock(ip)
-        # BUG-X3 Fix: iptables -D löscht nur die erste Übereinstimmung.
-        # Nach einem Absturz + Neustart können doppelte Regeln entstehen.
-        # While-Schleife wiederholt -D solange returncode == 0, bis alle weg sind.
+        
+        # BUG-A FIX: Verbesserte Cleanup-Logik für verwaiste Regeln
+        # Extrahiere IPs aus existierenden NetFireMon-Regeln und lösche mit -s <IP>
         if self.system == "Linux":
             for cmd in ("iptables", "ip6tables"):
                 try:
                     for chain in ("INPUT","OUTPUT","FORWARD"):
-                        for _ in range(200):   # Sicherheitsschranke gegen Endlosschleife
-                            r = subprocess.run(
-                                [cmd, "-D", chain, "-m", "comment",
-                                 "--comment", "NetFireMon", "-j", "DROP"],
-                                capture_output=True
-                            )
-                            if r.returncode != 0:
-                                break          # Keine Regel mehr vorhanden
-                except Exception:
-                    pass
+                        # Liste alle Regeln mit NetFireMon-Kommentar
+                        r = subprocess.run(
+                            [cmd, "-L", chain, "-n", "--line-numbers"],
+                            capture_output=True, text=True
+                        )
+                        if r.returncode != 0:
+                            continue
+                        
+                        # Extrahiere IPs aus den Regeln
+                        orphaned_ips = set()
+                        for line in r.stdout.splitlines():
+                            if "NetFireMon" in line and "DROP" in line:
+                                # Beispiel: "1    DROP  all  --  192.168.1.100  0.0.0.0/0  /* NetFireMon */"
+                                parts = line.split()
+                                if len(parts) >= 5:
+                                    ip = parts[4]  # Source IP
+                                    if ip and ip not in ("0.0.0.0/0", "anywhere"):
+                                        orphaned_ips.add(ip)
+                        
+                        # Lösche jede gefundene IP mit korrekter -s Syntax
+                        for ip in orphaned_ips:
+                            # Mehrfache Regeln für dieselbe IP löschen (while-Schleife)
+                            for _ in range(50):  # Max 50 Duplikate pro IP
+                                r = subprocess.run(
+                                    [cmd, "-D", chain, "-s", ip,
+                                     "-m", "comment", "--comment", "NetFireMon",
+                                     "-j", "DROP"],
+                                    capture_output=True
+                                )
+                                if r.returncode != 0:
+                                    break  # Keine weitere Regel für diese IP
+                except Exception as e:
+                    self._fw_logger.debug("cleanup_all: %s Chain %s: %s", cmd, chain, e)
 
     # ── Linux ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -1265,6 +1288,17 @@ class FirewallEngine:
         cmd = "ip6tables" if self._is_ipv6(ip) else "iptables"
         ok = True
         for chain in ("INPUT","OUTPUT","FORWARD"):
+            # BUG-B FIX: Prüfe erst ob die Regel bereits existiert (verhindert Duplikate)
+            check = subprocess.run(
+                [cmd, "-C", chain, "-s", ip,
+                 "-m", "comment", "--comment", "NetFireMon", "-j", "DROP"],
+                capture_output=True
+            )
+            if check.returncode == 0:
+                # Regel existiert bereits - überspringe Insert
+                continue
+            
+            # Regel existiert nicht - füge sie hinzu
             r = subprocess.run(
                 [cmd, "-I", chain, "-s", ip,
                  "-m", "comment", "--comment", "NetFireMon", "-j", "DROP"],
@@ -1409,6 +1443,10 @@ class ThreatIntelManager:
         self._lock = threading.Lock()
         self._bad_ips: set[str] = set()
         self._bad_cidrs: list   = []
+        # BUG-C FIX: Effiziente CIDR-Lookup-Struktur
+        # Statt O(N) Iteration nutzen wir sortierte Bereiche für O(log N) Binary Search
+        self._cidr_ranges_v4: list[tuple[int, int]] = []  # [(start_int, end_int), ...]
+        self._cidr_ranges_v6: list[tuple[int, int]] = []  # IPv6 analog
         self._last_update: float = 0.0
         self._logger = logging.getLogger("ThreatIntel")
         self._cache_file = DATA_DIR / "threat_intel_cache.txt"
@@ -1428,9 +1466,34 @@ class ThreatIntelManager:
                 return True
             try:
                 addr = ipaddress.ip_address(ip)
-                return any(addr in net for net in self._bad_cidrs)
+                # BUG-C FIX: Binary Search statt O(N) Iteration
+                # Konvertiere IP zu Integer für schnellen Vergleich
+                if isinstance(addr, ipaddress.IPv4Address):
+                    ip_int = int(addr)
+                    # Binary Search in sortierten IPv4-Bereichen
+                    return self._ip_in_ranges(ip_int, self._cidr_ranges_v4)
+                else:  # IPv6
+                    ip_int = int(addr)
+                    return self._ip_in_ranges(ip_int, self._cidr_ranges_v6)
             except ValueError:
                 return False
+    
+    def _ip_in_ranges(self, ip_int: int, ranges: list[tuple[int, int]]) -> bool:
+        """
+        Binary Search: Prüft ob ip_int in einem der sortierten Bereiche liegt.
+        Komplexität: O(log N) statt O(N)
+        """
+        left, right = 0, len(ranges) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            start, end = ranges[mid]
+            if ip_int < start:
+                right = mid - 1
+            elif ip_int > end:
+                left = mid + 1
+            else:  # start <= ip_int <= end
+                return True
+        return False
 
     def get_count(self) -> int:
         """Gibt die Anzahl der Einträge (IPs + CIDR-Netze) zurück."""
@@ -1497,12 +1560,36 @@ class ThreatIntelManager:
                 self._logger.warning("Feed-Fehler %s: %s", url, e)
 
         if new_ips or new_cidrs:
+            # BUG-C FIX Correction: Überlappende Subnetze verschmelzen!
+            # collapse_addresses() macht überlappende/benachbarte Netze zu disjunkten
+            # Blöcken – ohne das liefert die Binary Search Falsch-Negative!
+            collapsed_cidrs = list(ipaddress.collapse_addresses(new_cidrs))
+            # BUG-C FIX: Baue sortierte Bereiche für O(log N) Lookup
+            v4_ranges = []
+            v6_ranges = []
+            for net in collapsed_cidrs:
+                if isinstance(net, ipaddress.IPv4Network):
+                    start = int(net.network_address)
+                    end = int(net.broadcast_address)
+                    v4_ranges.append((start, end))
+                else:  # IPv6Network
+                    start = int(net.network_address)
+                    end = int(net.broadcast_address)
+                    v6_ranges.append((start, end))
+            
+            # Sortiere Bereiche für Binary Search
+            v4_ranges.sort(key=lambda x: x[0])
+            v6_ranges.sort(key=lambda x: x[0])
+            
             with self._lock:
                 self._bad_ips   = new_ips
-                self._bad_cidrs = new_cidrs
+                self._bad_cidrs = collapsed_cidrs
+                self._cidr_ranges_v4 = v4_ranges
+                self._cidr_ranges_v6 = v6_ranges
                 self._last_update = time.time()
-            self._save_cache(new_ips, new_cidrs)
-            self._logger.info("Threat Intel: %d IPs, %d CIDRs", len(new_ips), len(new_cidrs))
+            self._save_cache(new_ips, collapsed_cidrs)
+            self._logger.info("Threat Intel: %d IPs, %d CIDRs (%d v4 ranges, %d v6 ranges)", 
+                            len(new_ips), len(collapsed_cidrs), len(v4_ranges), len(v6_ranges))
 
     def _save_cache(self, ips: set, cidrs: list | None = None) -> None:
         # INFO Fix: CIDRs werden ebenfalls in den Cache geschrieben.
@@ -1530,7 +1617,33 @@ class ThreatIntelManager:
                         self._bad_ips.add(line)
                 except ValueError:
                     continue
-            self._logger.info("ThreatIntel Cache: %d Einträge", len(self._bad_ips))
+            
+            # BUG-C FIX Correction: Überlappende Subnetze verschmelzen vor der
+            # Binary-Search-Struktur – gilt auch für gecachte Daten beim Start!
+            collapsed_cidrs = list(ipaddress.collapse_addresses(self._bad_cidrs))
+            self._bad_cidrs = collapsed_cidrs
+
+            # BUG-C FIX: Baue sortierte CIDR-Bereiche auch beim Cache-Laden
+            v4_ranges = []
+            v6_ranges = []
+            for net in collapsed_cidrs:
+                if isinstance(net, ipaddress.IPv4Network):
+                    start = int(net.network_address)
+                    end = int(net.broadcast_address)
+                    v4_ranges.append((start, end))
+                else:  # IPv6Network
+                    start = int(net.network_address)
+                    end = int(net.broadcast_address)
+                    v6_ranges.append((start, end))
+            
+            v4_ranges.sort(key=lambda x: x[0])
+            v6_ranges.sort(key=lambda x: x[0])
+            self._cidr_ranges_v4 = v4_ranges
+            self._cidr_ranges_v6 = v6_ranges
+            
+            self._logger.info("ThreatIntel Cache: %d IPs, %d CIDRs (%d v4 ranges, %d v6 ranges)", 
+                            len(self._bad_ips), len(self._bad_cidrs), 
+                            len(v4_ranges), len(v6_ranges))
         except Exception:
             pass
 
@@ -1780,6 +1893,11 @@ class NetworkMonitor:
         if cfg.export_csv:
             self._open_csv()
         self._json_records: list[dict] = []
+        
+        # Kritische System-IPs (DNS, Gateway) – statisch beim Start erkannt,
+        # verhindert versehentliches Blockieren dieser Adressen.
+        self._critical_ips: set[str] = set()
+        self._discover_critical_ips()
 
     def _setup_logger(self) -> None:
         from logging.handlers import RotatingFileHandler
@@ -1788,6 +1906,58 @@ class NetworkMonitor:
         fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         self.logger.addHandler(fh)
+
+    def _discover_critical_ips(self) -> None:
+        """
+        BUG-D FIX: Entdecke und whitelist kritische System-IPs automatisch.
+        Verhindert IP-Spoofing DoS durch automatisches Blockieren von DNS, Gateway, etc.
+        """
+        critical = set()
+        
+        # 1. DNS-Server aus /etc/resolv.conf (Linux/macOS)
+        if platform.system() in ("Linux", "Darwin"):
+            try:
+                with open("/etc/resolv.conf") as f:
+                    for line in f:
+                        if line.startswith("nameserver"):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                dns_ip = parts[1]
+                                if validate_ip(dns_ip):
+                                    critical.add(dns_ip)
+                                    self.logger.info("Auto-Whitelist: DNS-Server %s", dns_ip)
+            except Exception:
+                pass
+        
+        # 2. Default Gateway (alle Systeme)
+        try:
+            import subprocess as sp
+            if platform.system() == "Linux":
+                r = sp.run(["ip", "route", "show", "default"], 
+                          capture_output=True, text=True, timeout=2)
+                for line in r.stdout.splitlines():
+                    if "default via" in line:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            gw = parts[2]
+                            if validate_ip(gw):
+                                critical.add(gw)
+                                self.logger.info("Auto-Whitelist: Gateway %s", gw)
+            elif platform.system() == "Darwin":
+                r = sp.run(["route", "-n", "get", "default"], 
+                          capture_output=True, text=True, timeout=2)
+                for line in r.stdout.splitlines():
+                    if "gateway:" in line:
+                        gw = line.split(":")[-1].strip()
+                        if validate_ip(gw):
+                            critical.add(gw)
+                            self.logger.info("Auto-Whitelist: Gateway %s", gw)
+        except Exception:
+            pass
+        
+        with self._lock:
+            self._critical_ips = critical
+    
 
     def _open_csv(self) -> None:
         self._report_file = open(self._report_path, "w", newline="", encoding="utf-8")
@@ -1874,6 +2044,10 @@ class NetworkMonitor:
             if dst_port:
                 self.port_counter[int(dst_port)] += 1
                 self._port_total[int(dst_port)]  += 1
+            
+            # Kritische IPs werden statisch beim Start via _discover_critical_ips()
+            # erkannt (DNS-Server, Gateway). Keine dynamische Zählung nötig –
+            # diese würde Angreifer nach 100 Paketen automatisch whitelisten!
 
         if self.cfg.detect_portscan and proto in ("TCP","UDP") and dst_port:
             self._check_portscan(src_ip, int(dst_port))
@@ -1995,9 +2169,26 @@ class NetworkMonitor:
         if _syslog:
             _syslog.send_alert(message, severity=4, src_ip=src_ip, reason=reason)
 
+        # BUG-D FIX: Auto-Block mit Schutz vor IP-Spoofing DoS
         if src_ip and _firewall and self.cfg.firewall_mode == "auto":
-            if src_ip not in self.cfg.whitelist and not is_private_ip(src_ip):
-                _firewall.block_ip(src_ip, reason=reason or message)
+            # Prüfe ob IP auf Whitelist oder kritisch ist
+            with self._lock:
+                is_critical = src_ip in self._critical_ips
+            
+            if src_ip in self.cfg.whitelist:
+                return  # Whitelist - niemals blockieren
+            if is_private_ip(src_ip):
+                return  # Private IPs - niemals blockieren
+            if is_critical:
+                # Kritische IP (DNS, Gateway) - nur warnen, nicht blockieren
+                self.logger.warning(
+                    "BUG-D Schutz: IP %s ist kritisch (DNS/Gateway), "
+                    "Auto-Block verhindert (möglicher IP-Spoofing-Angriff!)", src_ip
+                )
+                return
+            
+            # Sichere IP - kann blockiert werden
+            _firewall.block_ip(src_ip, reason=reason or message)
 
     def _evaluate_interval(self, elapsed: float) -> tuple[float, float, str]:
         with self._lock:

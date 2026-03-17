@@ -751,6 +751,9 @@ def _start_web_server(host: str, port: int, network_mode: bool,
                             except Exception:
                                 break
                             try:
+                                # BUG-E FIX: Timeout auf Connection-Socket setzen BEVOR wrap_socket()
+                                # Verhindert Slowloris-Angriffe (Client öffnet TCP aber sendet kein Client Hello)
+                                conn.settimeout(10.0)
                                 tls_conn = ssl_ctx_obj.wrap_socket(conn, server_side=True)
                                 t = _thr.Thread(
                                     target=_proxy_forward,
