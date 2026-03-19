@@ -411,6 +411,7 @@ def main() -> None:
         console.print(f"[yellow]⚠️   {len(fw.blocked_ips)} IP(s) sind noch blockiert![/yellow]")
         if auto_mode or Confirm.ask("Alle Firewall-Regeln aufheben?", default=True):
             fw.cleanup_all()
+            _core.save_persist() 
             console.print("[green]✅  Alle Regeln entfernt.[/green]")
 
     save_state(mon)

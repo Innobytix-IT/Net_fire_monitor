@@ -1,4 +1,4 @@
-# Net-Fire-Monitor v3.9
+# Net-Fire-Monitor v3.9.3
 
 > **(C) 2023–2026 Manuel Person – Innobytix-IT**
 
@@ -16,7 +16,7 @@
 ## Inhaltsverzeichnis
 
 1. [Was ist Net-Fire-Monitor?](#was-ist-net-fire-monitor)
-2. [Was ist neu in v3.9?](#was-ist-neu-in-v39)
+2. [Was ist neu in v3.9.3?](#was-ist-neu-in-v393)
 3. [Architektur (Zwei-Prozess-Modell)](#architektur-zwei-prozess-modell)
 4. [Voraussetzungen](#voraussetzungen)
 5. [Installation](#installation)
@@ -48,7 +48,13 @@ Das Tool bietet zwei Bedienoberflächen gleichzeitig:
 
 ---
 
-## Was ist neu in v3.9?
+## Benutzerhandbuch
+
+Fuer eine ausfuehrliche, leicht verstaendliche Anleitung fuer Endanwender siehe **[BENUTZERHANDBUCH.md](BENUTZERHANDBUCH.md)** – mit Workflows, Button-Erklaerungen und FAQ.
+
+---
+
+## Was ist neu in v3.9.3?
 
 | Änderung | Details |
 |----------|---------|
@@ -535,10 +541,13 @@ netfiremon/
 ├── core.py                          ← Gemeinsame Engine (Monitor, Firewall, TI, IPC)
 ├── netfiremon_web.py                ← Web-Interface (Flask/Gunicorn) + Setup-Wizard
 ├── netfiremon_terminal.py           ← Terminal-Dashboard (Rich)
+├── nfm_notfalladmin.py              ← Notfall-Admin-Tool (CLI)
 ├── netfiremon.service               ← systemd: Monitor-Prozess (root)
 ├── netfiremon-web.service           ← systemd: Web-Prozess (netfiremon user)
 ├── install.sh                       ← Installations-Skript
 ├── requirements.txt                 ← Python-Abhängigkeiten
+├── BENUTZERHANDBUCH.md              ← Endanwender-Dokumentation
+├── LICENSE                          ← MIT-Lizenz
 ├── web/
 │   ├── templates/
 │   │   ├── base.html                ← Basis-Layout mit CSRF-Helper
@@ -547,7 +556,8 @@ netfiremon/
 │   └── static/
 │       ├── app.js                   ← Navigation, Alarme, Listen, Regeln, Config
 │       ├── dashboard.js             ← Live-Graph, Stats, Top-Talker
-│       └── style.css                ← Terminal-Dark-Theme
+│       ├── style.css                ← Terminal-Dark-Theme
+│       └── fonts/                   ← Lokale Schriftarten (DSGVO-konform)
 └── certs/                           ← TLS-Zertifikat (auto-generiert)
     ├── cert.pem
     └── key.pem
@@ -587,7 +597,7 @@ GeoLite2-City.mmdb                   ← Geo-IP-Datenbank (zu groß für Git)
 ## Table of Contents
 
 1. [What is Net-Fire-Monitor?](#what-is-net-fire-monitor)
-2. [What's new in v3.9?](#whats-new-in-v39)
+2. [What's new in v3.9.3?](#whats-new-in-v393)
 3. [Architecture (Two-Process Model)](#architecture-two-process-model)
 4. [Requirements](#requirements)
 5. [Installation](#installation-1)
@@ -619,7 +629,7 @@ The tool provides two interfaces simultaneously:
 
 ---
 
-## What's new in v3.9?
+## What's new in v3.9.3?
 
 | Change | Details |
 |--------|---------|

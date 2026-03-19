@@ -1,8 +1,8 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  Net-Fire-Monitor v3.0 – Installations-Skript (Linux)
+#  Net-Fire-Monitor v3.9.3 – Installations-Skript (Linux)
 #
-#  Gemini-Audit Fix 3: Zwei-Prozess-Architektur
+#  Zwei-Prozess-Architektur:
 #   • netfiremon.service     → root (Scapy + iptables)
 #   • netfiremon-web.service → User "netfiremon" (kein root!)
 # ═══════════════════════════════════════════════════════════════
@@ -20,7 +20,7 @@ fi
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║   Net-Fire-Monitor v3.0 – Installation              ║"
+echo "║   Net-Fire-Monitor v3.9.3 – Installation             ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -50,10 +50,23 @@ mkdir -p "$INSTALL_DIR/data/cmd_queue"
 cp core.py                  "$INSTALL_DIR/"
 cp netfiremon_terminal.py   "$INSTALL_DIR/"
 cp netfiremon_web.py        "$INSTALL_DIR/"
+cp nfm_notfalladmin.py      "$INSTALL_DIR/"
 cp requirements.txt         "$INSTALL_DIR/"
 
 if [ -d "web" ]; then
     cp -r web "$INSTALL_DIR/"
+fi
+
+# systemd-Service-Dateien kopieren
+if [ -f "netfiremon.service" ]; then
+    cp netfiremon.service "$INSTALL_DIR/"
+else
+    echo "⚠️   netfiremon.service nicht gefunden!"
+fi
+if [ -f "netfiremon-web.service" ]; then
+    cp netfiremon-web.service "$INSTALL_DIR/"
+else
+    echo "⚠️   netfiremon-web.service nicht gefunden!"
 fi
 
 if [ -f "GeoLite2-City.mmdb" ]; then
@@ -107,11 +120,11 @@ echo ""
 echo "⚙️   Registriere systemd-Dienste …"
 
 # Monitor-Dienst (root)
-cp netfiremon.service /etc/systemd/system/netfiremon.service
+cp "$INSTALL_DIR/netfiremon.service" /etc/systemd/system/netfiremon.service
 sed -i "s|/opt/netfiremon|${INSTALL_DIR}|g" /etc/systemd/system/netfiremon.service
 
 # Web-Dienst (netfiremon user)
-cp netfiremon-web.service /etc/systemd/system/netfiremon-web.service
+cp "$INSTALL_DIR/netfiremon-web.service" /etc/systemd/system/netfiremon-web.service
 sed -i "s|/opt/netfiremon|${INSTALL_DIR}|g" /etc/systemd/system/netfiremon-web.service
 sed -i "s|User=netfiremon|User=${WEB_USER}|g" /etc/systemd/system/netfiremon-web.service
 sed -i "s|Group=netfiremon|Group=${WEB_GROUP}|g" /etc/systemd/system/netfiremon-web.service

@@ -330,8 +330,8 @@ def _build_flask_app(network_mode: bool, password_hash: str):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "font-src 'self'; "
             "img-src 'self' data:; "
             "connect-src 'self';"
         )
@@ -356,7 +356,8 @@ def _build_flask_app(network_mode: bool, password_hash: str):
             if _verify_password(pw, password_hash):
                 session["authenticated"] = True
                 session.permanent = True
-                _login_attempts.pop(client_ip, None)
+                with _login_lock:
+                    _login_attempts.pop(client_ip, None)
                 # Hash-Migration auf scrypt
                 if not password_hash.startswith("scrypt:"):
                     try:
@@ -369,12 +370,14 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                         pass
                 return redirect(url_for("index"))
             _record_failed(client_ip)
-            remaining = max(0, _LOCKOUT_ATTEMPTS - len(_login_attempts.get(client_ip, [])))
+            with _login_lock:
+                remaining = max(0, _LOCKOUT_ATTEMPTS - len(_login_attempts.get(client_ip, [])))
             return render_template("login.html",
                 error=f"Falsches Passwort! ({remaining} Versuch(e) verbleibend)")
         return render_template("login.html", error=None)
 
-    @app.route("/logout")
+    @app.route("/logout", methods=["POST"])
+    @_csrf_required
     def logout():
         session.clear()
         return redirect(url_for("login"))
@@ -502,21 +505,28 @@ def _build_flask_app(network_mode: bool, password_hash: str):
         if action in ("mute","unmute") and ip:
             if not validate_ip(ip):
                 return jsonify({"ok":False,"message":"Ungültige IP-Adresse"})
+            try:
+                dur = int(data.get("duration", 3600))
+            except (ValueError, TypeError):
+                return jsonify({"ok":False,"message":"Ungültige Dauer"})
             if _is_single_process() and _mon_ref:
                 if action == "mute":
-                    _mon_ref.mute_ip(ip, duration_secs=int(data.get("duration",3600)))
+                    _mon_ref.mute_ip(ip, duration_secs=dur)
                 else:
                     _mon_ref.unmute_ip(ip)
                 return jsonify({"ok":True,"message":f"{ip} {'stummgeschaltet' if action=='mute' else 'entstummt'}"})
             else:
                 cmd = {"action": action, "ip": ip}
                 if action == "mute":
-                    cmd["duration"] = int(data.get("duration", 3600))
+                    cmd["duration"] = dur
                 CommandQueue.push(cmd)
                 return jsonify({"ok":True,"message":"Wird verarbeitet"})
 
         if action == "set_cooldown":
-            secs = int(data.get("seconds", 300))
+            try:
+                secs = int(data.get("seconds", 300))
+            except (ValueError, TypeError):
+                return jsonify({"ok":False,"message":"Ungültiger Wert"})
             if not (0 <= secs <= 86400):
                 return jsonify({"ok":False,"message":"Ungültiger Cooldown (0–86400s)"})
             if _is_single_process() and _mon_ref:
@@ -591,7 +601,10 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                 return jsonify({"ok":False,"message":"Ungültiges Protokoll"})
             rules.append({"proto":proto,"port":port,"src_ip":src_ip,"action":act,"comment":comment})
         elif action == "delete":
-            idx = int(data.get("index",-1))
+            try:
+                idx = int(data.get("index", -1))
+            except (ValueError, TypeError):
+                return jsonify({"ok":False,"message":"Ungültiger Index"})
             if not (0 <= idx < len(rules)):
                 return jsonify({"ok":False,"message":"Ungültiger Index"})
             rules.pop(idx)
@@ -647,6 +660,34 @@ def _build_flask_app(network_mode: bool, password_hash: str):
         try:
             data = request.get_json() or {}
             data.pop("email_password", None)
+
+            # Serverseitige Validierung für numerische Felder
+            _CONFIG_RANGES = {
+                "threshold":        (1, 500),
+                "monitor_interval": (1, 300),
+                "average_period":   (10, 600),
+                "email_port":       (1, 65535),
+                "portscan_limit":   (5, 10000),
+                "report_rotate":    (1, 365),
+                "syslog_port":      (1, 65535),
+                "threat_intel_update_interval": (300, 86400),
+            }
+            for field, (lo, hi) in _CONFIG_RANGES.items():
+                if field in data:
+                    try:
+                        val = int(data[field])
+                        if val < lo or val > hi:
+                            return jsonify({"ok":False,
+                                "message":f"{field}: Wert muss zwischen {lo} und {hi} liegen"})
+                    except (ValueError, TypeError):
+                        return jsonify({"ok":False,
+                            "message":f"{field}: Ungültiger Zahlenwert"})
+
+            if "firewall_mode" in data and data["firewall_mode"] not in ("monitor","confirm","auto"):
+                return jsonify({"ok":False,"message":"Ungültiger Firewall-Modus"})
+            if "syslog_protocol" in data and data["syslog_protocol"] not in ("udp","tcp"):
+                return jsonify({"ok":False,"message":"Ungültiges Syslog-Protokoll"})
+
             cfg = Config.load()
             for k, v in data.items():
                 if k in WRITABLE_FIELDS and hasattr(cfg, k):
@@ -666,6 +707,9 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                     else:
                         _c._email.cfg = cfg
                 else:
+                    # BUG-X1b Fix (v3.9.1): Worker-Thread sauber beenden bevor Referenz gelöscht wird
+                    if _c._email is not None:
+                        _c._email.stop()
                     _c._email = None
                 if cfg.syslog_enabled:
                     if _c._syslog is None:
@@ -673,6 +717,9 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                     else:
                         _c._syslog.cfg = cfg
                 else:
+                    # BUG-X1b Fix (v3.9.1): Worker-Thread sauber beenden
+                    if _c._syslog is not None:
+                        _c._syslog.stop()
                     _c._syslog = None
             else:
                 CommandQueue.push({"action": "reload_config"})
@@ -1137,6 +1184,7 @@ def main() -> None:
         console.print(f"[yellow]⚠️   {len(fw.blocked_ips)} IP(s) sind noch blockiert![/yellow]")
         if auto_mode or Confirm.ask("Alle Firewall-Regeln aufheben?", default=True):
             fw.cleanup_all()
+            _core.save_persist() 
             console.print("[green]✅  Alle Regeln entfernt.[/green]")
 
     save_state(mon)

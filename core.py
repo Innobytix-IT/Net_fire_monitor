@@ -69,7 +69,22 @@ CMD_QUEUE_DIR.mkdir(exist_ok=True)
 # FIRST-RUN SETUP
 # ════════════════════════════════════════════════════════════════════════════
 
-SETUP_DONE_FILE = SCRIPT_DIR / ".nm_setup_done"
+# BUG-10 Fix (v3.9): Setup-Marker in DATA_DIR statt SCRIPT_DIR.
+# Unter ProtectSystem=strict (systemd) ist SCRIPT_DIR read-only.
+# Rückwärtskompatibilität: beide Pfade werden beim Check berücksichtigt.
+_SETUP_DONE_FILE_NEW = DATA_DIR  / ".nm_setup_done"
+_SETUP_DONE_FILE_OLD = SCRIPT_DIR / ".nm_setup_done"
+
+
+class _SetupDoneFile:
+    """Wrapper der beide Pfade prüft (Rückwärtskompatibilität) aber nur in DATA_DIR schreibt."""
+    def exists(self) -> bool:
+        return _SETUP_DONE_FILE_NEW.exists() or _SETUP_DONE_FILE_OLD.exists()
+    def write_text(self, text: str) -> None:
+        _SETUP_DONE_FILE_NEW.write_text(text)
+
+
+SETUP_DONE_FILE = _SetupDoneFile()
 
 # BUG-B Fix: Modul-weiter Lock schützt alle Schreibzugriffe auf CONFIG_FILE
 # und PERSIST_FILE gegen Race-Conditions wenn Monitor- und Web-Prozess
@@ -90,7 +105,8 @@ def _pip_install(package: str) -> bool:
     if platform.system() == "Linux":
         cmd.append("--break-system-packages")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                errors="replace", timeout=120)
         return result.returncode == 0
     except Exception:
         return False
@@ -100,7 +116,8 @@ def _check_npcap_windows() -> bool:
     import winreg
     for key_path in [r"SOFTWARE\Npcap", r"SOFTWARE\WOW6432Node\Npcap", r"SOFTWARE\WinPcap"]:
         try:
-            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+            key.Close()
             return True
         except FileNotFoundError:
             continue
@@ -311,10 +328,10 @@ class Config:
                 encoding="utf-8"
             )
             if platform.system() != "Windows":
-                tmp.chmod(0o600)
+                tmp.chmod(0o640)
             tmp.replace(CONFIG_FILE)   # atomares Rename – kein halbfertiger Read möglich
         if platform.system() != "Windows":
-            CONFIG_FILE.chmod(0o600)
+            CONFIG_FILE.chmod(0o640)
         if email_pw:
             _save_email_password(email_pw)
         # BUG-04 Fix (v3.9): Warnung wenn öffentliche IPs in der Whitelist stehen.
@@ -401,9 +418,9 @@ def _setup_web_password() -> str:
             continue
         h = _hash_password(pw)
         web_cfg = DATA_DIR / "net_fire_monitor_web_config.json"
-        web_cfg.write_text(json.dumps({"password_hash": h}, indent=2))
+        web_cfg.write_text(json.dumps({"password_hash": h}, indent=2), encoding="utf-8")
         if platform.system() != "Windows":
-            web_cfg.chmod(0o600)
+            web_cfg.chmod(0o640)
         return h
 
 
@@ -481,7 +498,14 @@ def resolve_hostname(ip: str) -> str:
         host = ip
     _dns_lru.set(ip, host)
     # Rückwärtskompatibilität: auch altes dict befüllen (wird in terminal.py gelesen)
+    # BUG-01b Fix (v3.9.1): Altes dict ebenfalls begrenzen um Memory Leak zu verhindern.
     with _dns_lock:
+        if len(_dns_cache) >= _DNS_CACHE_MAXSIZE:
+            try:
+                oldest = next(iter(_dns_cache))
+                del _dns_cache[oldest]
+            except StopIteration:
+                pass
         _dns_cache[ip] = host
     return host
 
@@ -545,14 +569,18 @@ def enrich_ip(ip: str) -> dict:
     if not validate_ip(ip):
         return {"hostname":"–","geo":"–","org":"–","whois_raw":"–","threat_intel":False}
     result = {"hostname":"–","geo":"–","org":"–","whois_raw":"–","threat_intel":False}
-    old = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(3.0)
-    try:
-        result["hostname"] = socket.gethostbyaddr(ip)[0]
-    except Exception:
-        result["hostname"] = "Nicht auflösbar"
-    finally:
-        socket.setdefaulttimeout(old)
+    # BUG-TI4 Fix (v3.9.1): Thread-isolierter DNS-Lookup statt socket.setdefaulttimeout().
+    # setdefaulttimeout() modifiziert globalen Zustand und ist nicht thread-safe.
+    _host_result = ["Nicht auflösbar"]
+    def _lookup():
+        try:
+            _host_result[0] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            pass
+    t = threading.Thread(target=_lookup, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    result["hostname"] = _host_result[0]
     try:
         if _geo_reader:
             r = _geo_reader.city(ip)
@@ -562,6 +590,11 @@ def enrich_ip(ip: str) -> dict:
             result["geo"] = f"{city}, {country} ({iso})" if city else f"{country} ({iso})"
     except Exception:
         pass
+    # BUG-07 Fix (v3.9): Threat-Intel-Status korrekt prüfen.
+    # Vorher wurde result["threat_intel"] nie auf True gesetzt → E-Mails zeigten
+    # immer "Nicht bekannt", selbst für Threat-Intel-gelistete IPs.
+    if _threat_intel and _threat_intel.is_bad(ip):
+        result["threat_intel"] = True
     # BUG-X2 Fix: nslookup-subprocess entfernt.
     # socket.gethostbyaddr() liefert denselben Hostnamen ohne externe Abhängigkeit
     # und ohne 5s blockierenden subprocess-Aufruf.
@@ -682,10 +715,14 @@ def save_state(mon: "NetworkMonitor") -> None:
             "log_alerts":     alerts[-50:],
         }
 
-        STATE_FILE.write_text(
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(
             json.dumps(state, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8"
         )
+        if platform.system() != "Windows":
+            tmp.chmod(0o640)
+        tmp.replace(STATE_FILE)
     except Exception as e:
         logging.getLogger("NetMonitor").error("Fehler beim Speichern des States: %s", e)
 
@@ -790,7 +827,7 @@ def save_persist() -> None:
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         if platform.system() != "Windows":
-            tmp.chmod(0o600)
+            tmp.chmod(0o640)
         tmp.replace(PERSIST_FILE)
     except Exception as e:
         logging.getLogger("NetMonitor").warning("Persistenz-Speicherung fehlgeschlagen: %s", e)
@@ -1179,6 +1216,7 @@ class FirewallEngine:
     def unblock_ip(self, ip: str) -> None:
         with self._lock:
             self.blocked_ips.discard(ip)
+            self._block_timestamps.pop(ip, None)
         try:
             self._action_queue.put_nowait(("unblock", ip, ""))
         except queue.Full:
@@ -1229,6 +1267,7 @@ class FirewallEngine:
         self.stop()
         with self._lock:
             ips = list(self.blocked_ips)
+            self.blocked_ips.clear()
         for ip in ips:
             self._do_unblock(ip)
         
@@ -1271,6 +1310,41 @@ class FirewallEngine:
                                     break  # Keine weitere Regel für diese IP
                 except Exception as e:
                     self._fw_logger.debug("cleanup_all: %s Chain %s: %s", cmd, chain, e)
+
+        # BUG-13 FIX: Windows – verwaiste NetFireMon-Regeln aufräumen
+        elif self.system == "Windows":
+            try:
+                r = self._win_run([
+                    "netsh", "advfirewall", "firewall", "show", "rule",
+                    "name=all", "dir=in"
+                ])
+                for line in r.stdout.splitlines():
+                    line_s = line.strip()
+                    # Regelname-Zeilen: "Regelname:  NetFireMon_Block_1.2.3.4_in"
+                    # oder englisch: "Rule Name:  NetFireMon_Block_..."
+                    if ("Regelname" in line_s or "Rule Name" in line_s) and "NetFireMon_Block_" in line_s:
+                        rule_name = line_s.split(":", 1)[1].strip()
+                        subprocess.run(
+                            ["netsh", "advfirewall", "firewall", "delete", "rule",
+                             f"name={rule_name}"],
+                            capture_output=True
+                        )
+                # Outbound-Regeln ebenfalls
+                r = self._win_run([
+                    "netsh", "advfirewall", "firewall", "show", "rule",
+                    "name=all", "dir=out"
+                ])
+                for line in r.stdout.splitlines():
+                    line_s = line.strip()
+                    if ("Regelname" in line_s or "Rule Name" in line_s) and "NetFireMon_Block_" in line_s:
+                        rule_name = line_s.split(":", 1)[1].strip()
+                        subprocess.run(
+                            ["netsh", "advfirewall", "firewall", "delete", "rule",
+                             f"name={rule_name}"],
+                            capture_output=True
+                        )
+            except Exception as e:
+                self._fw_logger.debug("cleanup_all Windows: %s", e)
 
     # ── Linux ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -1322,22 +1396,47 @@ class FirewallEngine:
         return any_ok
 
     # ── Windows ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _win_run(cmd: list) -> subprocess.CompletedProcess:
+        """subprocess.run mit OEM-Encoding für Windows-Konsolenprogramme (netsh, ipconfig).
+        Verhindert UnicodeDecodeError bei deutschen Umlauten in der Ausgabe."""
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="oem", errors="replace")
+
     def _block_windows(self, ip: str) -> bool:
-        name = f"NetFireMon_Block_{ip}"
-        r = subprocess.run([
-            "netsh","advfirewall","firewall","add","rule",
-            f"name={name}","dir=in","action=block",
-            f"remoteip={ip}","enable=yes"
-        ], capture_output=True, text=True)
-        return r.returncode == 0
+        # BUG-08 Fix (v3.9): Inbound UND Outbound blockieren (analog zu Linux INPUT+OUTPUT+FORWARD).
+        # Vorher wurde nur dir=in gesetzt – ausgehender Traffic zur blockierten IP blieb möglich.
+        ok = True
+        for direction in ("in", "out"):
+            name = f"NetFireMon_Block_{ip}_{direction}"
+            r = self._win_run([
+                "netsh","advfirewall","firewall","add","rule",
+                f"name={name}", f"dir={direction}", "action=block",
+                f"remoteip={ip}", "enable=yes"
+            ])
+            ok = ok and r.returncode == 0
+        return ok
 
     def _unblock_windows(self, ip: str) -> bool:
-        name = f"NetFireMon_Block_{ip}"
-        r = subprocess.run([
+        # BUG-08 Fix (v3.9): Beide Richtungen entfernen.
+        any_ok = False
+        for direction in ("in", "out"):
+            name = f"NetFireMon_Block_{ip}_{direction}"
+            r = self._win_run([
+                "netsh","advfirewall","firewall","delete","rule",
+                f"name={name}"
+            ])
+            if r.returncode == 0:
+                any_ok = True
+        # Rückwärtskompatibilität: auch alte Regeln ohne Richtungs-Suffix entfernen
+        old_name = f"NetFireMon_Block_{ip}"
+        r = self._win_run([
             "netsh","advfirewall","firewall","delete","rule",
-            f"name={name}"
-        ], capture_output=True, text=True)
-        return r.returncode == 0
+            f"name={old_name}"
+        ])
+        if r.returncode == 0:
+            any_ok = True
+        return any_ok
     # ── macOS ──────────────────────────────────────────────────────────────
     def _block_macos(self, ip: str) -> bool:
         try:
@@ -1563,7 +1662,12 @@ class ThreatIntelManager:
             # BUG-C FIX Correction: Überlappende Subnetze verschmelzen!
             # collapse_addresses() macht überlappende/benachbarte Netze zu disjunkten
             # Blöcken – ohne das liefert die Binary Search Falsch-Negative!
-            collapsed_cidrs = list(ipaddress.collapse_addresses(new_cidrs))
+            # BUG-14 Fix: IPv4 und IPv6 müssen getrennt collapsed werden,
+            # sonst TypeError bei gemischten Feeds.
+            v4_nets = [n for n in new_cidrs if isinstance(n, ipaddress.IPv4Network)]
+            v6_nets = [n for n in new_cidrs if isinstance(n, ipaddress.IPv6Network)]
+            collapsed_cidrs = list(ipaddress.collapse_addresses(v4_nets)) + \
+                              list(ipaddress.collapse_addresses(v6_nets))
             # BUG-C FIX: Baue sortierte Bereiche für O(log N) Lookup
             v4_ranges = []
             v6_ranges = []
@@ -1607,7 +1711,7 @@ class ThreatIntelManager:
         if not self._cache_file.exists():
             return
         try:
-            for line in self._cache_file.read_text().splitlines():
+            for line in self._cache_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line: continue
                 try:
@@ -1620,7 +1724,11 @@ class ThreatIntelManager:
             
             # BUG-C FIX Correction: Überlappende Subnetze verschmelzen vor der
             # Binary-Search-Struktur – gilt auch für gecachte Daten beim Start!
-            collapsed_cidrs = list(ipaddress.collapse_addresses(self._bad_cidrs))
+            # BUG-14 Fix: IPv4/IPv6 getrennt collapsieren.
+            v4_nets = [n for n in self._bad_cidrs if isinstance(n, ipaddress.IPv4Network)]
+            v6_nets = [n for n in self._bad_cidrs if isinstance(n, ipaddress.IPv6Network)]
+            collapsed_cidrs = list(ipaddress.collapse_addresses(v4_nets)) + \
+                              list(ipaddress.collapse_addresses(v6_nets))
             self._bad_cidrs = collapsed_cidrs
 
             # BUG-C FIX: Baue sortierte CIDR-Bereiche auch beim Cache-Laden
@@ -1729,7 +1837,13 @@ class SyslogExporter:
     def _send(self, message: str, severity: int, src_ip: str, reason: str) -> None:
         import socket as _sock
         priority = self.cfg.syslog_facility * 8 + severity
-        ts = datetime.now().strftime("%b %d %H:%M:%S").replace("  "," ")
+        # BUG-11 Fix (v3.9): Locale-unabhängiger Syslog-Timestamp (RFC 3164).
+        # strftime("%b") gibt auf deutschem System "Mär" statt "Mar" aus →
+        # SIEM-Server die englische Monatsnamen erwarten, schlagen beim Parsen fehl.
+        _SYSLOG_MONTHS = ("Jan","Feb","Mar","Apr","May","Jun",
+                          "Jul","Aug","Sep","Oct","Nov","Dec")
+        _now = datetime.now()
+        ts = f"{_SYSLOG_MONTHS[_now.month - 1]} {_now.day:2d} {_now.strftime('%H:%M:%S')}"
         try:
             hostname = _sock.gethostname()
         except Exception:
@@ -1891,7 +2005,12 @@ class NetworkMonitor:
         self._csv_writer = None
         self._report_file = None
         if cfg.export_csv:
-            self._open_csv()
+            try:
+                self._open_csv()
+            except OSError as e:
+                self.logger.error("CSV-Export nicht möglich (%s) – Aufzeichnung deaktiviert.", e)
+                self._csv_writer = None
+                self._report_file = None
         self._json_records: list[dict] = []
         
         # Kritische System-IPs (DNS, Gateway) – statisch beim Start erkannt,
@@ -1911,9 +2030,10 @@ class NetworkMonitor:
         """
         BUG-D FIX: Entdecke und whitelist kritische System-IPs automatisch.
         Verhindert IP-Spoofing DoS durch automatisches Blockieren von DNS, Gateway, etc.
+        BUG-09 Fix (v3.9): Windows-Unterstützung hinzugefügt.
         """
         critical = set()
-        
+
         # 1. DNS-Server aus /etc/resolv.conf (Linux/macOS)
         if platform.system() in ("Linux", "Darwin"):
             try:
@@ -1928,12 +2048,12 @@ class NetworkMonitor:
                                     self.logger.info("Auto-Whitelist: DNS-Server %s", dns_ip)
             except Exception:
                 pass
-        
-        # 2. Default Gateway (alle Systeme)
+
+        # 2. Default Gateway und DNS (alle Systeme)
         try:
             import subprocess as sp
             if platform.system() == "Linux":
-                r = sp.run(["ip", "route", "show", "default"], 
+                r = sp.run(["ip", "route", "show", "default"],
                           capture_output=True, text=True, timeout=2)
                 for line in r.stdout.splitlines():
                     if "default via" in line:
@@ -1944,7 +2064,7 @@ class NetworkMonitor:
                                 critical.add(gw)
                                 self.logger.info("Auto-Whitelist: Gateway %s", gw)
             elif platform.system() == "Darwin":
-                r = sp.run(["route", "-n", "get", "default"], 
+                r = sp.run(["route", "-n", "get", "default"],
                           capture_output=True, text=True, timeout=2)
                 for line in r.stdout.splitlines():
                     if "gateway:" in line:
@@ -1952,9 +2072,32 @@ class NetworkMonitor:
                         if validate_ip(gw):
                             critical.add(gw)
                             self.logger.info("Auto-Whitelist: Gateway %s", gw)
+            elif platform.system() == "Windows":
+                # BUG-09 Fix: DNS-Server und Gateway unter Windows erkennen
+                # ipconfig /all liefert DNS-Server und Default-Gateway
+                # encoding="oem" nutzt die OEM-Codepage (cp850/cp437) in der
+                # Windows-Konsolenprogramme wie ipconfig ihre Ausgabe kodieren.
+                # text=True allein nutzt cp1252, was bei Umlauten (0x81) crasht.
+                r = sp.run(["ipconfig", "/all"],
+                          capture_output=True, text=True,
+                          encoding="oem", errors="replace", timeout=5)
+                for line in r.stdout.splitlines():
+                    line_stripped = line.strip()
+                    # DNS-Server und Gateway extrahieren
+                    for marker in ("DNS-Server", "DNS Servers",
+                                   "Standardgateway", "Default Gateway"):
+                        if marker in line_stripped and ":" in line_stripped:
+                            val = line_stripped.split(":", 1)[1].strip()
+                            # Mehrere IPs können durch Komma oder Leerzeichen getrennt sein
+                            for part in val.replace(",", " ").split():
+                                part = part.strip("() ")
+                                if validate_ip(part) and not part.startswith("fe80"):
+                                    critical.add(part)
+                                    self.logger.info("Auto-Whitelist (Windows): %s (%s)",
+                                                     part, marker)
         except Exception:
             pass
-        
+
         with self._lock:
             self._critical_ips = critical
     
@@ -2355,7 +2498,7 @@ class NetworkMonitor:
                     if 0 <= secs <= 86400:
                         self._alert_cooldown_secs = secs
 
-                # ── Config-Reload (Gemini-Audit Fix 3) ───────────────────
+# ── Config-Reload (Gemini-Audit Fix 3) ───────────────────
                 # Web-Prozess schreibt cfg.save() + push("reload_config").
                 # Monitor lädt Config neu → kein Split-Brain mehr.
                 elif action == "reload_config":
@@ -2365,6 +2508,7 @@ class NetworkMonitor:
                     # Alle abhängigen Engines neu starten
                     global _rule_engine, _email, _syslog, _threat_intel
                     _rule_engine = RuleEngine(new_cfg)
+                    
                     if new_cfg.email_enabled:
                         if _email is None:
                             _email = EmailNotifier(new_cfg)
@@ -2374,7 +2518,7 @@ class NetworkMonitor:
                         if _email:
                             _email.stop()
                         _email = None
-                    # SyslogExporter: stop() vor Neustart damit kein Zombie-Thread bleibt
+
                     if new_cfg.syslog_enabled:
                         if _syslog is None:
                             _syslog = SyslogExporter(new_cfg)
@@ -2384,7 +2528,7 @@ class NetworkMonitor:
                         if _syslog:
                             _syslog.stop()
                         _syslog = None
-                    # ThreatIntelManager: bei Feeds-Änderung neu laden
+
                     if new_cfg.threat_intel_enabled:
                         if _threat_intel is None:
                             _threat_intel = ThreatIntelManager(new_cfg)
@@ -2394,7 +2538,20 @@ class NetworkMonitor:
                         if _threat_intel:
                             _threat_intel.stop()
                         _threat_intel = None
-                    self.logger.info("IPC reload_config: Config neu geladen.")
+
+                    # --- DIESER TEIL WAR FALSCH EINGERÜCKT ---
+                    if _firewall:
+                        if PERSIST_FILE.exists():
+                            try:
+                                data = json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
+                                with _firewall._lock:
+                                    _firewall.blocked_ips = set(data.get("blocked_ips", []))
+                                self.logger.info("IPC: Firewall-Blockliste neu von Festplatte geladen.")
+                            except: 
+                                pass
+                    # ----------------------------------------
+                        
+                    self.logger.info("IPC reload_config: Config & Blockliste neu geladen.")
 
                 # ── Whitelist / Blacklist ─────────────────────────────────
                 # Werden jetzt NUR über reload_config synchronisiert:
