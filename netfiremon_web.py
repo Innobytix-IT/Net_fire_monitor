@@ -453,7 +453,9 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                 ip  = next((p.strip(".,:()")
                             for p in msg.split()
                             if validate_ip(p.strip(".,:()"))), "")
-                alarms.append({"ts": ts, "msg": msg, "ip": ip})
+                geo  = geo_lookup(ip) if ip else "–"
+                host = resolve_hostname(ip) if ip else "–"
+                alarms.append({"ts": ts, "msg": msg, "ip": ip, "geo": geo, "host": host})
 
         # 2. Fallback: Log-Datei
         if not alarms and LOG_FILE.exists():
@@ -466,7 +468,9 @@ def _build_flask_app(network_mode: bool, password_hash: str):
                 ip  = next((p.strip(".,:()")
                             for p in msg.split()
                             if validate_ip(p.strip(".,:()"))), "")
-                alarms.append({"ts": ts, "msg": msg, "ip": ip})
+                geo  = geo_lookup(ip) if ip else "–"
+                host = resolve_hostname(ip) if ip else "–"
+                alarms.append({"ts": ts, "msg": msg, "ip": ip, "geo": geo, "host": host})
                 if len(alarms) >= 200:
                     break
 
