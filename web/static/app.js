@@ -8,6 +8,7 @@
 
 window.NFM = window.NFM || {};
 var NFM = window.NFM;
+NFM.dismissedAlarms = new Set();
 
 // ── Hilfsfunktionen ─────────────────────────────────────────
 NFM.escHtml = s =>
@@ -27,23 +28,6 @@ NFM.toast = (msg, type='inf') => {
   setTimeout(() => el.remove(), 3500);
 };
 
-// ── Navigation ───────────────────────────────────────────────
-NFM.showPage = (name, btn) => {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-  const page = document.getElementById('page-' + name);
-  if (page) page.classList.add('active');
-  if (btn)  btn.classList.add('active');
-  const loaders = {
-    alarms: NFM.loadAlarms,
-    lists:  NFM.loadLists,
-    rules:  NFM.loadRules,
-    logs:   () => NFM.loadLog('monitor'),
-    config: NFM.loadConfigUI,
-  };
-  if (loaders[name]) loaders[name]();
-};
-
 // ══════════════════════════════════════════════════════════════
 // ALARME
 // ══════════════════════════════════════════════════════════════
@@ -57,7 +41,7 @@ NFM.loadAlarms = async () => {
     NFM.renderAlarms(data.alarms || []);
   } catch(e) {
     const c = document.getElementById('alarm-list');
-    if (c) c.innerHTML = '<div style="color:var(--red);padding:16px;">Fehler: ' + e + '</div>';
+    if (c) c.innerHTML = '<div style="color:var(--red);padding:16px;">Fehler: ' + NFM.escHtml(String(e)) + '</div>';
   }
 };
 
@@ -71,24 +55,34 @@ NFM.filterAlarms = (f, btn) => {
 NFM.renderAlarms = (alarms) => {
   const c = document.getElementById('alarm-list');
   if (!c) return;
-  const filtered = NFM.alarmFilter === 'all'
-    ? alarms
-    : alarms.filter(a => a.msg.includes(NFM.alarmFilter));
+  
+  // Filtern: Suchbegriff anwenden UND weggeklickte Alarme ignorieren
+  const filtered = alarms.filter(a => {
+    const alarmId = a.ts + '_' + (a.ip || '');
+    if (NFM.dismissedAlarms.has(alarmId)) return false; // Bereits weggeklickt
+    if (NFM.alarmFilter !== 'all' && !a.msg.toLowerCase().includes(NFM.alarmFilter.toLowerCase())) return false;
+    return true;
+  });
+
   if (!filtered.length) {
+// ...
     c.innerHTML = '<div style="color:var(--green);padding:24px;text-align:center;">✅ Keine Alarme</div>';
     return;
   }
   c.innerHTML = filtered.map((a, i) => {
+    const alarmId = a.ts + '_' + (a.ip || '');
     const tc = a.msg.includes('Threat')||a.msg.includes('☠️') ? 'ti' :
                a.msg.includes('Port')                          ? 'scan' :
                a.msg.includes('Regel')                         ? 'rule' :
                a.msg.includes('Blacklist')                     ? 'bl' : '';
     const isMuted = NFM.mutedIps && a.ip && NFM.mutedIps.includes(a.ip);
-    return `<div class="alarm-card ${tc}" id="alarm-card-${i}">
+    return `<div class="alarm-card ${tc}" id="alarm-card-${i}" data-alarm-id="${NFM.escAttr(alarmId)}">
       <div class="a-ts">🕐 ${NFM.escHtml(a.ts)}</div>
       <div class="a-msg">🚨 ${NFM.escHtml(a.msg)}</div>
       ${a.ip ? `<div class="a-meta">
         IP: <span>${NFM.escHtml(a.ip)}</span>
+        ${a.host && a.host !== '–' ? `&nbsp;|&nbsp; 🏷️ <span>${NFM.escHtml(a.host)}</span>` : ''}
+        ${a.geo && a.geo !== '–' ? `&nbsp;|&nbsp; 🌍 <span>${NFM.escHtml(a.geo)}</span>` : ''}
         ${isMuted ? '&nbsp;|&nbsp; <span style="color:var(--yellow)">🔇 Stumm</span>' : ''}
       </div>` : ''}
       <div class="a-acts">
@@ -100,7 +94,7 @@ NFM.renderAlarms = (alarms) => {
           ? `<button class="btn btn-b" data-ip="${NFM.escAttr(a.ip)}" onclick="NFM.unmuteIp(this.dataset.ip,this)">🔔 Entstummen</button>`
           : `<button class="btn btn-d" style="position:relative" data-ip="${NFM.escAttr(a.ip)}" onclick="NFM.showMuteMenu(this)">🔇 Stumm ▾</button>`
         }` : ''}
-        <button class="btn btn-d" onclick="this.closest('.alarm-card').style.opacity='.3'">⏭ Überspringen</button>
+        <button class="btn btn-d" onclick="NFM.dismissAlarm(this)">⏭ Überspringen</button>
       </div>
     </div>`;
   }).join('');
@@ -110,6 +104,29 @@ NFM.alarmActFromBtn = btn => {
   const ip     = btn.dataset.ip;
   const action = btn.dataset.act;
   NFM.alarmAct(action, ip, btn);
+};
+
+NFM.dismissAlarm = (btn) => {
+  const card = btn.closest('.alarm-card');
+  if (!card) return;
+  
+  const alarmId = card.dataset.alarmId;
+  if (alarmId) NFM.dismissedAlarms.add(alarmId);
+
+  // Animation: Sanft ausblenden und zusammenschieben
+  card.style.transition = 'all 0.3s ease';
+  card.style.opacity = '0';
+  card.style.transform = 'translateX(20px)';
+  card.style.height = card.offsetHeight + 'px'; // Höhe fixieren für weichen Übergang
+  
+  setTimeout(() => {
+      card.style.padding = '0';
+      card.style.margin = '0';
+      card.style.height = '0';
+      card.style.border = 'none';
+  }, 300);
+
+  setTimeout(() => card.remove(), 600);
 };
 
 NFM.alarmAct = async (action, ip, btn) => {
@@ -127,15 +144,15 @@ NFM.alarmAct = async (action, ip, btn) => {
       body: JSON.stringify(body)
     });
     const d = await r.json();
+    
     if (d.ok) {
       NFM.toast(d.message, 'ok');
-      const card = btn.closest('.alarm-card');
-      if (card) {
-        card.style.borderLeftColor = 'var(--green)';
-        card.querySelector('.a-acts').innerHTML =
-          `<span style="color:var(--green);font-size:11px;">✅ ${NFM.escHtml(d.message)}</span>`;
-      }
-    } else { NFM.toast(d.message,'err'); }
+      NFM.dismissAlarm(btn); // Alarm sanft ausblenden
+      if (action !== 'block') NFM.loadLists(); 
+    } else { 
+      NFM.toast(d.message,'err'); 
+    }
+    
   } catch(e) { NFM.toast('Fehler: '+e,'err'); }
 };
 
@@ -587,6 +604,17 @@ NFM.saveConfig = async () => {
     if (d.ok) NFM.toast('Konfiguration gespeichert ✅','ok');
     else       NFM.toast('Fehler: '+d.message,'err');
   } catch(e) { NFM.toast('Fehler beim Speichern','err'); }
+};
+
+// ══════════════════════════════════════════════════════════════
+// KONFIGURATION – Sektionen auf-/zuklappen
+// ══════════════════════════════════════════════════════════════
+NFM.toggleSection = (titleEl) => {
+  const body = titleEl.nextElementSibling;
+  if (!body) return;
+  body.classList.toggle('collapsed');
+  const arrow = titleEl.querySelector('span');
+  if (arrow) arrow.textContent = body.classList.contains('collapsed') ? '▶' : '▼';
 };
 
 // ── Auto-Refresh ─────────────────────────────────────────────
